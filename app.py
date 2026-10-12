@@ -1,51 +1,89 @@
-from flask import Flask, render_template, request, jsonify
+"""Currency converter - Flask app using live exchange rates."""
+import os
+import time
+
 import requests
-from cachetools import TTLCache
+from flask import Flask, jsonify, render_template, request
 
-app = Flask(__name__)
+RATES_URL = "https://api.exchangerate-api.com/v4/latest/{base}"
+CACHE_SECONDS = 60 * 60
+SUPPORTED = ["EUR", "USD", "GBP", "BRL", "CAD", "AUD", "JPY", "CHF", "CNY", "INR", "PLN", "SEK"]
 
-# Cache de taxas de câmbio (TTL de 1 hora)
-exchange_rate_cache = TTLCache(maxsize=100, ttl=3600)
 
-@app.route('/')
-def index():
-    return render_template('index.html')
+class RateProvider:
+    """Fetches exchange rates and keeps them in memory for an hour,
+    so we don't call the external API on every conversion."""
 
-@app.route('/convert', methods=['POST'])
-def convert():
-    try:
-        data = request.json
-        base_currency = data['base'].upper()
-        target_currency = data['target'].upper()
-        amount = float(data['amount'])
+    def __init__(self, ttl=CACHE_SECONDS, clock=time.monotonic):
+        self.ttl = ttl
+        self.clock = clock
+        self._cache = {}
 
-        # Validação do valor inserido
+    def get_rates(self, base):
+        cached = self._cache.get(base)
+        if cached and self.clock() - cached[0] < self.ttl:
+            return cached[1]
+        response = requests.get(RATES_URL.format(base=base), timeout=5)
+        response.raise_for_status()
+        rates = response.json()["rates"]
+        self._cache[base] = (self.clock(), rates)
+        return rates
+
+
+def error(message, status=400):
+    return jsonify({"error": message}), status
+
+
+def create_app(provider=None):
+    app = Flask(__name__)
+    rates = provider or RateProvider()
+
+    @app.get("/")
+    def index():
+        return render_template("index.html", currencies=SUPPORTED)
+
+    @app.get("/api/currencies")
+    def currencies():
+        return jsonify(SUPPORTED)
+
+    @app.post("/convert")
+    def convert():
+        data = request.get_json(silent=True)
+        if not isinstance(data, dict):
+            return error("Request body must be JSON.")
+
+        base = str(data.get("base", "")).upper()
+        target = str(data.get("target", "")).upper()
+        if base not in SUPPORTED or target not in SUPPORTED:
+            return error("Unsupported currency.")
+
+        try:
+            amount = float(data.get("amount"))
+        except (TypeError, ValueError):
+            return error("Amount must be a number.")
         if amount <= 0:
-            return jsonify({'error': 'Valor inválido. O valor deve ser maior que 0.'}), 400
+            return error("Amount must be greater than 0.")
 
-        # Verifica se já temos as taxas em cache
-        if base_currency in exchange_rate_cache:
-            exchange_rates = exchange_rate_cache[base_currency]
+        if base == target:
+            rate = 1.0
         else:
-            api_url = f"https://api.exchangerate-api.com/v4/latest/{base_currency}"
-            response = requests.get(api_url)
-            if response.status_code != 200:
-                return jsonify({'error': 'Erro ao obter taxas de câmbio.'}), 500
-            exchange_rates = response.json()['rates']
-            exchange_rate_cache[base_currency] = exchange_rates
+            try:
+                rate = rates.get_rates(base)[target]
+            except (requests.RequestException, KeyError, ValueError):
+                return error("Exchange rates are unavailable right now. Please try again.", 503)
 
-        # Verifica se a moeda de destino está nas taxas de câmbio
-        if target_currency in exchange_rates:
-            conversion_rate = exchange_rates[target_currency]
-            converted_amount = amount * conversion_rate
-            return jsonify({'converted_amount': round(converted_amount, 2)})
-        else:
-            return jsonify({'error': 'Moeda de destino não suportada.'}), 400
+        return jsonify({
+            "base": base,
+            "target": target,
+            "amount": amount,
+            "rate": rate,
+            "converted_amount": round(amount * rate, 2),
+        })
 
-    except ValueError:
-        return jsonify({'error': 'O valor deve ser numérico.'}), 400
-    except Exception as e:
-        return jsonify({'error': 'Erro interno no servidor.'}), 500
+    return app
 
-if __name__ == '__main__':
-    app.run(debug=True)
+
+app = create_app()
+
+if __name__ == "__main__":
+    app.run(debug=os.getenv("FLASK_DEBUG") == "1")
